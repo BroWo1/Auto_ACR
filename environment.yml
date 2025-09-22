@@ -1,0 +1,17 @@
+name: auto_acr
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26
+  - imageio
+  - opencv
+  - tqdm
+  - pillow
+  - pip:
+      - torch
+      - torchvision
+      - torchaudio
+      - rawpy
+
