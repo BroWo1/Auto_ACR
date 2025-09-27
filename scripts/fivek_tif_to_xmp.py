@@ -17,7 +17,8 @@ acr-autopilot/
     processed/tiff16_c/**/<name>.tif
     training.json validation.json testing.json  # optional, from the helper repo
   outputs/xmps/
-  outputs/previews/
+  outputs/1_preview/
+  outputs/1_data/
   scripts/fivek_tif_to_xmp.py
 """
 
@@ -860,15 +861,11 @@ def fit_params_for_pair(raw_path: Path, tif_path: Path, device: torch.device,
 # -------------------------------
 
 def load_split_paths(root: Path, expert: str, split: str) -> List[Tuple[Path,Path]]:
-    """
-    Load (raw_path, tif_path) pairs from training/validation/testing.json if available,
-    otherwise fallback to stem-based matching.
-    """
-    pairs: List[Tuple[Path,Path]] = []
+    """Return (raw_path, tif_path) pairs by scanning RAWs and matching the expert's TIFFs."""
+
     # Lightweight testing mode: allow a single ad-hoc pair placed anywhere under --root
     if split == "testing":
-        # Look for common RAW + TIF in the provided root without enforcing FiveK layout
-        raw_exts = ["*.dng"]  # keep minimal; extend if needed
+        raw_exts = ["*.dng"]
         tif_exts = ["*.tif", "*.tiff"]
         raw_list: List[Path] = []
         tif_list: List[Path] = []
@@ -877,47 +874,45 @@ def load_split_paths(root: Path, expert: str, split: str) -> List[Tuple[Path,Pat
         for pat in tif_exts:
             tif_list.extend(root.rglob(pat))
 
-        # Try to pair by stem if possible, else fall back to the first of each
-        if raw_list and tif_list:
-            tif_map = {p.stem: p for p in sorted(tif_list)}
-            raw_list = sorted(raw_list)
-            chosen_raw = None
-            chosen_tif = None
-            for rp in raw_list:
-                tp = tif_map.get(rp.stem)
-                if tp is not None:
-                    chosen_raw, chosen_tif = rp, tp
-                    break
-            if chosen_raw is None:
-                chosen_raw, chosen_tif = raw_list[0], sorted(tif_list)[0]
-            return [(chosen_raw, chosen_tif)]
-        else:
+        if not raw_list or not tif_list:
             return []
-    # JSON path like data/MITAboveFiveK/training.json
-    split_json = root / f"{split}.json"
-    tif_dir = root / f"processed/tiff16_{expert}"
-    raw_dir = root / "raw"
 
+        tif_map = {p.stem: p for p in sorted(tif_list)}
+        for raw_path in sorted(raw_list):
+            tif_path = tif_map.get(raw_path.stem)
+            if tif_path is not None:
+                return [(raw_path, tif_path)]
+
+        return [(sorted(raw_list)[0], sorted(tif_list)[0])]
+
+    raw_dir = root / "raw"
+    tif_dir = root / f"processed/tiff16_{expert}"
+
+    if not raw_dir.exists() or not tif_dir.exists():
+        return []
+
+    allowed_stems: Optional[set[str]] = None
+    split_json = root / f"{split}.json"
     if split_json.exists():
         data = json.loads(split_json.read_text())
-        for item in data:
-            # helper repo uses entries with "basename" and per-expert names;
-            # we reconstruct paths using the provided structure.
-            base = Path(item["basename"]).stem
-            # raw path: raw/**/basename.dng
-            raw_path = next(raw_dir.glob(f"**/{base}.dng"), None)
-            tif_path = next(tif_dir.glob(f"**/{base}.tif"), None)
-            if raw_path and tif_path:
-                pairs.append((raw_path, tif_path))
-    else:
-        # fallback to stem match
-        raw_paths = sorted(raw_dir.glob("**/*.dng"))
-        tif_paths = sorted(tif_dir.glob("**/*.tif"))
-        tif_map = {p.stem: p for p in tif_paths}
-        for rp in raw_paths:
-            tp = tif_map.get(rp.stem)
-            if tp is not None:
-                pairs.append((rp, tp))
+        allowed_stems = {Path(item["basename"]).stem for item in data}
+
+    def _find_tif(stem: str) -> Optional[Path]:
+        for ext in (".tif", ".tiff"):
+            match = next(tif_dir.glob(f"**/{stem}{ext}"), None)
+            if match is not None:
+                return match
+        return None
+
+    pairs: List[Tuple[Path, Path]] = []
+    for raw_path in sorted(raw_dir.rglob("*.dng")):
+        stem = raw_path.stem
+        if allowed_stems is not None and stem not in allowed_stems:
+            continue
+        tif_path = _find_tif(stem)
+        if tif_path is None:
+            continue
+        pairs.append((raw_path, tif_path))
     return pairs
 
 # -------------------------------
@@ -928,9 +923,10 @@ def main():
     repo_root = Path(__file__).resolve().parents[1]
     default_root = repo_root / "data" / "MITAboveFiveK"
     default_xmp = repo_root / "outputs" / "xmps"
-    default_prev = repo_root / "outputs" / "previews"
-    default_params = repo_root / "outputs" / "params"
+    default_prev = repo_root / "outputs" / "1_preview"
+    default_params = repo_root / "outputs" / "1_data"
     default_luts = repo_root / "outputs" / "luts"
+    default_manifest = repo_root / "outputs" / "dataset_manifest.jsonl"
 
     ap = argparse.ArgumentParser(description="Fit PV2012 sliders to FiveK expert TIFs and write XMP")
     ap.add_argument("--root", default=str(default_root), help="Dataset root (default: data/MITAboveFiveK)")
@@ -938,7 +934,7 @@ def main():
                     help="Which split to process if JSON is available (default: training)")
     ap.add_argument("--expert", default="c", help="Expert a|b|c|d|e (default: c)")
     ap.add_argument("--out_xmp_dir", default=str(default_xmp), help="Output XMP dir (default: outputs/xmps)")
-    ap.add_argument("--out_preview_dir", default=str(default_prev), help="Output preview dir (default: outputs/previews)")
+    ap.add_argument("--out_preview_dir", default=str(default_prev), help="Output preview dir (default: outputs/1_preview)")
     ap.add_argument("--device", default="mps", help="mps|cuda|cpu (default: mps)")
     ap.add_argument("--long_side", type=int, default=512, help="thumbnail long side (px)")
     ap.add_argument("--steps", type=int, default=800, help="optimization steps per image")
@@ -948,11 +944,16 @@ def main():
     ap.add_argument("--log_every", type=int, default=0, help="print loss every N steps (0=off)")
     ap.add_argument("--curve_knots", type=int, default=16,
                     help="number of tone-curve knots (higher = more flexibility; default 16)")
-    ap.add_argument("--export_json", action="store_true", help="also export fitted params as JSON")
+    ap.add_argument("--export_json", dest="export_json", action="store_true", default=True,
+                    help="also export fitted params as JSON (default: enabled)")
+    ap.add_argument("--no-export_json", dest="export_json", action="store_false",
+                    help="disable JSON export")
     ap.add_argument("--export_cube", action="store_true", help="also export baked 3D LUT in linear ProPhoto")
-    ap.add_argument("--out_params_dir", default=str(default_params), help="Output JSON dir")
+    ap.add_argument("--out_params_dir", default=str(default_params), help="Output JSON dir (default: outputs/1_data)")
     ap.add_argument("--out_lut_dir", default=str(default_luts), help="Output 3D LUT dir")
     ap.add_argument("--lut_size", type=int, default=33, help="3D LUT size (e.g., 33)")
+    ap.add_argument("--out_dataset_manifest", default=str(default_manifest),
+                    help="Path to JSONL manifest mapping ids to 1_preview/1_data (default: outputs/dataset_manifest.jsonl)")
     args = ap.parse_args()
 
     # device selection (MPS, CUDA, or CPU)
@@ -968,6 +969,7 @@ def main():
     out_prev_dir = Path(args.out_preview_dir); out_prev_dir.mkdir(parents=True, exist_ok=True)
     out_params_dir = Path(args.out_params_dir); out_params_dir.mkdir(parents=True, exist_ok=True)
     out_lut_dir = Path(args.out_lut_dir); out_lut_dir.mkdir(parents=True, exist_ok=True)
+    manifest_records: List[Dict[str, object]] = []
 
     pairs = load_split_paths(root, args.expert, args.split)
     if args.limit > 0:
@@ -996,11 +998,13 @@ def main():
 
             # Preview PNG
             prev_img = (np.clip(preview * 255.0, 0, 255)).astype(np.uint8)  # HxWx3
-            iio.imwrite(out_prev_dir / f"{raw_path.stem}.png", prev_img)
+            preview_out = out_prev_dir / f"{raw_path.stem}.png"
+            iio.imwrite(preview_out, prev_img)
 
+            json_out_path: Optional[Path] = None
             if args.export_json:
-                json_out = out_params_dir / f"{raw_path.stem}.json"
-                export_params_json(params_denorm, params_norm, json_out)
+                json_out_path = out_params_dir / f"{raw_path.stem}.json"
+                export_params_json(params_denorm, params_norm, json_out_path)
             if args.export_cube:
                 cube_out = out_lut_dir / f"{raw_path.stem}_prophoto_lin_size{args.lut_size}.cube"
                 export_lut3d_cube_prophoto_linear(params_denorm, size=args.lut_size, out_path=cube_out)
@@ -1014,8 +1018,42 @@ def main():
                 y_png = (np.clip(y_png01 * 255.0, 0, 255)).astype(np.uint8)
                 iio.imwrite(out_prev_dir / f"{raw_path.stem}__raw_srgb.png", x_png)
                 iio.imwrite(out_prev_dir / f"{raw_path.stem}__tif_srgb.png", y_png)
+
+            if json_out_path is not None:
+                manifest_records.append({
+                    "id": raw_path.stem,
+                    "split": args.split,
+                    "expert": args.expert,
+                    "raw": raw_path,
+                    "tif": tif_path,
+                    "1_preview": preview_out,
+                    "1_data": json_out_path,
+                })
         except Exception as e:
             print(f"[warn] failed on {raw_path.name}: {e}", file=sys.stderr)
+
+    if manifest_records:
+        manifest_path = Path(args.out_dataset_manifest)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _manifest_path(path: Path) -> str:
+            try:
+                return str(path.resolve().relative_to(manifest_path.parent.resolve()))
+            except ValueError:
+                return str(path.resolve())
+
+        with manifest_path.open("w", encoding="utf-8") as mf:
+            for record in manifest_records:
+                serializable = {
+                    "id": record["id"],
+                    "split": record["split"],
+                    "expert": record["expert"],
+                    "raw": _manifest_path(record["raw"]),
+                    "tif": _manifest_path(record["tif"]),
+                    "1_preview": _manifest_path(record["1_preview"]),
+                    "1_data": _manifest_path(record["1_data"]),
+                }
+                mf.write(json.dumps(serializable) + "\n")
 
 if __name__ == "__main__":
     main()
