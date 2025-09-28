@@ -894,8 +894,21 @@ def load_split_paths(root: Path, expert: str, split: str) -> List[Tuple[Path,Pat
     allowed_stems: Optional[set[str]] = None
     split_json = root / f"{split}.json"
     if split_json.exists():
-        data = json.loads(split_json.read_text())
-        allowed_stems = {Path(item["basename"]).stem for item in data}
+        raw_entries = json.loads(split_json.read_text())
+        allowed_stems = set()
+
+        for entry in raw_entries:
+            if isinstance(entry, dict):
+                basename = entry.get("basename")
+                if basename:
+                    allowed_stems.add(Path(basename).stem)
+                continue
+
+            if isinstance(entry, str):
+                allowed_stems.add(Path(entry).stem)
+
+        if not allowed_stems:
+            allowed_stems = None
 
     def _find_tif(stem: str) -> Optional[Path]:
         for ext in (".tif", ".tiff"):
@@ -940,7 +953,7 @@ def main():
     ap.add_argument("--steps", type=int, default=800, help="optimization steps per image")
     ap.add_argument("--lr", type=float, default=5e-2, help="optimizer LR")
     ap.add_argument("--limit", type=int, default=0, help="limit number of pairs (0=all)")
-    ap.add_argument("--debug_previews", action="store_true", help="save raw/tif/preview debug PNGs")
+    ap.add_argument("--debug_previews", action="store_true", help="save edited preview and target TIFF debug PNGs")
     ap.add_argument("--log_every", type=int, default=0, help="print loss every N steps (0=off)")
     ap.add_argument("--curve_knots", type=int, default=16,
                     help="number of tone-curve knots (higher = more flexibility; default 16)")
@@ -981,7 +994,7 @@ def main():
     print(f"[info] device={device}, pairs={len(pairs)}")
     for raw_path, tif_path in tqdm(pairs, desc="Fitting", unit="img"):
         try:
-            params_denorm, params_norm, preview = fit_params_for_pair(
+            params_denorm, params_norm, edited_preview = fit_params_for_pair(
                 raw_path, tif_path, device,
                 long_side=args.long_side,
                 steps=args.steps, lr=args.lr,
@@ -996,10 +1009,12 @@ def main():
             xmp_out = out_xmp_dir / f"{raw_path.stem}.xmp"
             xmp_out.write_text(xmp_str, encoding="utf-8")
 
-            # Preview PNG
-            prev_img = (np.clip(preview * 255.0, 0, 255)).astype(np.uint8)  # HxWx3
+            # Baseline (unedited) preview PNG
+            raw_thumb = read_raw_linear_prophoto(raw_path, long_side=args.long_side)
+            raw_preview01 = prophoto_to_srgb_preview(raw_thumb)
+            raw_img = (np.clip(raw_preview01 * 255.0, 0, 255)).astype(np.uint8)
             preview_out = out_prev_dir / f"{raw_path.stem}.png"
-            iio.imwrite(preview_out, prev_img)
+            iio.imwrite(preview_out, raw_img)
 
             json_out_path: Optional[Path] = None
             if args.export_json:
@@ -1010,13 +1025,12 @@ def main():
                 export_lut3d_cube_prophoto_linear(params_denorm, size=args.lut_size, out_path=cube_out)
 
             if args.debug_previews:
-                # Save raw and tif thumbnails for inspection as sRGB PNGs
-                x_pp = read_raw_linear_prophoto(raw_path, long_side=args.long_side)
-                x_png01 = prophoto_to_srgb_preview(x_pp)
+                # Save edited preview and target TIFF thumbnails for inspection
+                edit_img = (np.clip(edited_preview * 255.0, 0, 255)).astype(np.uint8)
+                iio.imwrite(out_prev_dir / f"{raw_path.stem}__edit_srgb.png", edit_img)
+
                 y_png01 = read_tif16_color_managed_to_srgb_png(tif_path, long_side=args.long_side)
-                x_png = (np.clip(x_png01 * 255.0, 0, 255)).astype(np.uint8)
                 y_png = (np.clip(y_png01 * 255.0, 0, 255)).astype(np.uint8)
-                iio.imwrite(out_prev_dir / f"{raw_path.stem}__raw_srgb.png", x_png)
                 iio.imwrite(out_prev_dir / f"{raw_path.stem}__tif_srgb.png", y_png)
 
             if json_out_path is not None:
