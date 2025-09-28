@@ -993,6 +993,15 @@ def main():
 
     print(f"[info] device={device}, pairs={len(pairs)}")
     for raw_path, tif_path in tqdm(pairs, desc="Fitting", unit="img"):
+        preview_out = out_prev_dir / f"{raw_path.stem}.png"
+        json_out_candidate: Optional[Path] = None
+        if args.export_json:
+            json_out_candidate = out_params_dir / f"{raw_path.stem}.json"
+
+        if preview_out.exists() and (json_out_candidate is None or json_out_candidate.exists()):
+            print(f"[skip] {raw_path.stem}: preview/json already exist", file=sys.stderr)
+            continue
+
         try:
             params_denorm, params_norm, edited_preview = fit_params_for_pair(
                 raw_path, tif_path, device,
@@ -1013,12 +1022,11 @@ def main():
             raw_thumb = read_raw_linear_prophoto(raw_path, long_side=args.long_side)
             raw_preview01 = prophoto_to_srgb_preview(raw_thumb)
             raw_img = (np.clip(raw_preview01 * 255.0, 0, 255)).astype(np.uint8)
-            preview_out = out_prev_dir / f"{raw_path.stem}.png"
             iio.imwrite(preview_out, raw_img)
 
             json_out_path: Optional[Path] = None
             if args.export_json:
-                json_out_path = out_params_dir / f"{raw_path.stem}.json"
+                json_out_path = json_out_candidate if json_out_candidate is not None else out_params_dir / f"{raw_path.stem}.json"
                 export_params_json(params_denorm, params_norm, json_out_path)
             if args.export_cube:
                 cube_out = out_lut_dir / f"{raw_path.stem}_prophoto_lin_size{args.lut_size}.cube"
