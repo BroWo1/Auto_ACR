@@ -982,6 +982,79 @@ def main():
     out_prev_dir = Path(args.out_preview_dir); out_prev_dir.mkdir(parents=True, exist_ok=True)
     out_params_dir = Path(args.out_params_dir); out_params_dir.mkdir(parents=True, exist_ok=True)
     out_lut_dir = Path(args.out_lut_dir); out_lut_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load or rebuild manifest
+    manifest_path = Path(args.out_dataset_manifest)
+    existing_records: Dict[str, Dict[str, object]] = {}
+
+    # First, try to load existing manifest
+    if manifest_path.exists():
+        print(f"[info] Loading existing manifest from {manifest_path}")
+        with manifest_path.open("r", encoding="utf-8") as mf:
+            for line in mf:
+                line = line.strip()
+                if line:
+                    try:
+                        record = json.loads(line)
+                        key = (record["id"], record["split"], record["expert"])
+                        existing_records[key] = record
+                    except (json.JSONDecodeError, KeyError) as e:
+                        print(f"[warn] Skipping invalid manifest line: {e}")
+        print(f"[info] Loaded {len(existing_records)} entries from manifest")
+
+    # Rebuild from existing output files (resume capability)
+    print(f"[info] Scanning output directories for existing processed images...")
+    rebuilt_count = 0
+    for preview_file in out_prev_dir.glob("*.png"):
+        # Skip debug preview files
+        if "__" in preview_file.stem:
+            continue
+
+        image_id = preview_file.stem
+        json_file = out_params_dir / f"{image_id}.json"
+
+        # Only consider valid pairs with both preview and JSON
+        if not json_file.exists():
+            continue
+
+        # Try to determine split and expert from JSON or use current args
+        try:
+            with json_file.open("r") as f:
+                json_data = json.load(f)
+            # JSON might not have split/expert, use defaults from args
+            split = json_data.get("split", args.split)
+            expert = json_data.get("expert", args.expert)
+        except:
+            split = args.split
+            expert = args.expert
+
+        key = (image_id, split, expert)
+
+        # If not in manifest, try to find corresponding RAW/TIFF
+        if key not in existing_records:
+            # Search for matching RAW file
+            raw_candidates = list(root.rglob(f"**/{image_id}.dng"))
+            tif_candidates = list(root.rglob(f"**/{image_id}.tif")) + list(root.rglob(f"**/{image_id}.tiff"))
+
+            if raw_candidates and tif_candidates:
+                raw_path = raw_candidates[0]
+                tif_path = tif_candidates[0]
+
+                existing_records[key] = {
+                    "id": image_id,
+                    "split": split,
+                    "expert": expert,
+                    "raw": raw_path,
+                    "tif": tif_path,
+                    "preview": preview_file,
+                    "data": json_file,
+                }
+                rebuilt_count += 1
+
+    if rebuilt_count > 0:
+        print(f"[info] Rebuilt {rebuilt_count} entries from existing output files")
+        print(f"[info] Total entries in manifest: {len(existing_records)}")
+
     manifest_records: List[Dict[str, object]] = []
 
     pairs = load_split_paths(root, args.expert, args.split)
@@ -998,7 +1071,14 @@ def main():
         if args.export_json:
             json_out_candidate = out_params_dir / f"{raw_path.stem}.json"
 
+        # Check if already processed (in manifest or files exist)
+        key = (raw_path.stem, args.split, args.expert)
+        if key in existing_records:
+            # Already in manifest, skip
+            continue
+
         if preview_out.exists() and (json_out_candidate is None or json_out_candidate.exists()):
+            # Files exist but not in manifest - will be added to manifest after this loop
             print(f"[skip] {raw_path.stem}: preview/json already exist", file=sys.stderr)
             continue
 
@@ -1048,34 +1128,44 @@ def main():
                     "expert": args.expert,
                     "raw": raw_path,
                     "tif": tif_path,
-                    "1_preview": preview_out,
-                    "1_data": json_out_path,
+                    "preview": preview_out,
+                    "data": json_out_path,
                 })
         except Exception as e:
             print(f"[warn] failed on {raw_path.name}: {e}", file=sys.stderr)
 
-    if manifest_records:
-        manifest_path = Path(args.out_dataset_manifest)
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    # Merge new records with existing records
+    manifest_path = Path(args.out_dataset_manifest)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        def _manifest_path(path: Path) -> str:
-            try:
-                return str(path.resolve().relative_to(manifest_path.parent.resolve()))
-            except ValueError:
-                return str(path.resolve())
+    # Update existing_records with new records (overwrites if same key)
+    for record in manifest_records:
+        key = (record["id"], record["split"], record["expert"])
+        existing_records[key] = record
 
-        with manifest_path.open("w", encoding="utf-8") as mf:
-            for record in manifest_records:
-                serializable = {
-                    "id": record["id"],
-                    "split": record["split"],
-                    "expert": record["expert"],
-                    "raw": _manifest_path(record["raw"]),
-                    "tif": _manifest_path(record["tif"]),
-                    "1_preview": _manifest_path(record["1_preview"]),
-                    "1_data": _manifest_path(record["1_data"]),
-                }
-                mf.write(json.dumps(serializable) + "\n")
+    # Write all records (existing + new) to manifest
+    def _manifest_path(path: Path) -> str:
+        try:
+            return str(path.resolve().relative_to(manifest_path.parent.resolve()))
+        except ValueError:
+            return str(path.resolve())
+
+    all_records = sorted(existing_records.values(), key=lambda r: (r["split"], r["expert"], r["id"]))
+
+    with manifest_path.open("w", encoding="utf-8") as mf:
+        for record in all_records:
+            serializable = {
+                "id": record["id"],
+                "split": record["split"],
+                "expert": record["expert"],
+                "raw": _manifest_path(Path(record["raw"])),
+                "tif": _manifest_path(Path(record["tif"])),
+                "preview": _manifest_path(Path(record["preview"])),
+                "data": _manifest_path(Path(record["data"])),
+            }
+            mf.write(json.dumps(serializable) + "\n")
+
+    print(f"[info] Manifest written with {len(all_records)} total entries → {manifest_path.resolve()}")
 
 if __name__ == "__main__":
     main()
