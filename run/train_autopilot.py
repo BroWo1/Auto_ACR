@@ -209,12 +209,14 @@ class PreviewParamsDataset(Dataset):
                     use_camera_wb=True,
                 )
 
-            # Resize to edit resolution
+            # Resize to edit resolution (ensure dimensions are consistent)
             h, w = rgb16.shape[:2]
-            scale = self.edit_resolution / max(h, w)
-            if scale < 1.0:
-                new_w, new_h = int(w * scale), int(h * scale)
+            if max(h, w) > self.edit_resolution:
+                scale = self.edit_resolution / max(h, w)
+                new_w, new_h = int(round(w * scale)), int(round(h * scale))
                 rgb16 = cv2.resize(rgb16, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                new_h, new_w = h, w
 
             # Convert to [C, H, W] float tensor in [0, 1]
             tensor = torch.from_numpy(rgb16).permute(2, 0, 1).float() / 65535.0
@@ -239,12 +241,14 @@ class PreviewParamsDataset(Dataset):
             # Read TIFF
             arr = iio.imread(str(path))
 
-            # Resize to edit resolution
+            # Resize to edit resolution (ensure dimensions are consistent)
             h, w = arr.shape[:2]
-            scale = self.edit_resolution / max(h, w)
-            if scale < 1.0:
-                new_w, new_h = int(w * scale), int(h * scale)
+            if max(h, w) > self.edit_resolution:
+                scale = self.edit_resolution / max(h, w)
+                new_w, new_h = int(round(w * scale)), int(round(h * scale))
                 arr = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                new_h, new_w = h, w
 
             # Normalize to [0, 1]
             if np.issubdtype(arr.dtype, np.floating):
@@ -278,36 +282,38 @@ def collate_fn(batch: List[Sample]) -> Dict[str, torch.Tensor]:
 
     result = {"image": images, "scalars": scalars, "tone": tone}
 
-    # Add raw and target if available
-    if batch[0].raw is not None:
-        # Filter out None values and pad to same size
+    # Add raw and target if available (ensure they match in size)
+    if batch[0].raw is not None or batch[0].target is not None:
         raw_images = [s.raw for s in batch if s.raw is not None]
-        if raw_images:
-            # Pad to same size (find max dimensions)
-            max_h = max(img.shape[1] for img in raw_images)
-            max_w = max(img.shape[2] for img in raw_images)
-            padded_raw = []
-            for img in raw_images:
-                if img.shape[1] < max_h or img.shape[2] < max_w:
-                    pad_h = max_h - img.shape[1]
-                    pad_w = max_w - img.shape[2]
-                    img = F.pad(img, (0, pad_w, 0, pad_h))
-                padded_raw.append(img)
-            result["raw"] = torch.stack(padded_raw, dim=0)
-
-    if batch[0].target is not None:
         target_images = [s.target for s in batch if s.target is not None]
-        if target_images:
-            max_h = max(img.shape[1] for img in target_images)
-            max_w = max(img.shape[2] for img in target_images)
-            padded_target = []
-            for img in target_images:
-                if img.shape[1] < max_h or img.shape[2] < max_w:
-                    pad_h = max_h - img.shape[1]
-                    pad_w = max_w - img.shape[2]
-                    img = F.pad(img, (0, pad_w, 0, pad_h))
-                padded_target.append(img)
-            result["target"] = torch.stack(padded_target, dim=0)
+
+        # Find max dimensions across both raw and target
+        all_images = raw_images + target_images
+        if all_images:
+            max_h = max(img.shape[1] for img in all_images)
+            max_w = max(img.shape[2] for img in all_images)
+
+            # Pad raw images
+            if raw_images:
+                padded_raw = []
+                for img in raw_images:
+                    if img.shape[1] < max_h or img.shape[2] < max_w:
+                        pad_h = max_h - img.shape[1]
+                        pad_w = max_w - img.shape[2]
+                        img = F.pad(img, (0, pad_w, 0, pad_h))
+                    padded_raw.append(img)
+                result["raw"] = torch.stack(padded_raw, dim=0)
+
+            # Pad target images
+            if target_images:
+                padded_target = []
+                for img in target_images:
+                    if img.shape[1] < max_h or img.shape[2] < max_w:
+                        pad_h = max_h - img.shape[1]
+                        pad_w = max_w - img.shape[2]
+                        img = F.pad(img, (0, pad_w, 0, pad_h))
+                    padded_target.append(img)
+                result["target"] = torch.stack(padded_target, dim=0)
 
     return result
 

@@ -1154,6 +1154,10 @@ def main():
 
     with manifest_path.open("w", encoding="utf-8") as mf:
         for record in all_records:
+            # Skip records missing required fields (e.g., from failed processing)
+            if "preview" not in record or "data" not in record:
+                continue
+
             serializable = {
                 "id": record["id"],
                 "split": record["split"],
