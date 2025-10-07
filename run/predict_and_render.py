@@ -20,18 +20,20 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional
 
 import numpy as np
 import torch
 import rawpy
 import cv2
+import tifffile
 import imageio.v3 as iio
 from PIL import Image
 from torchvision import transforms as T
 from torchvision.transforms import InterpolationMode
 
 from model.autopilot import AutoPilotRegressor, BackboneConfig
+from model.lora import LoRAConfig, LoRALinear, inject_lora
 from params.ranges import SCALAR_NAMES, denormalize_scalars, denormalize_tone_curve
 
 # Add scripts to path for edit layer access
@@ -58,7 +60,24 @@ def parse_args():
     parser.add_argument("--backbone", default="vit_small_patch16_224", help="Backbone architecture")
     parser.add_argument("--tiff-bit-depth", type=int, choices=[8, 16], default=16, help="TIFF bit depth")
     parser.add_argument("--export-json", action="store_true", help="Also export predicted parameters as JSON")
-    parser.add_argument("--render-resolution", type=int, default=2048, help="Max resolution for rendering (lower = faster)")
+    parser.add_argument("--render-resolution", type=int, default=None, help="Max resolution for rendering (default: original size)")
+    parser.add_argument(
+        "--icc-profile",
+        type=Path,
+        default=None,
+        help="Path to ProPhoto ICC profile (.icc/.icm) to embed in rendered TIFF (default: repo ProPhoto.icm if present)",
+    )
+    parser.add_argument(
+        "--srgb-output",
+        action="store_true",
+        help="Render edits as sRGB preview using the same pipeline as scripts/apply_lut",
+    )
+    parser.add_argument(
+        "--lora-checkpoint",
+        type=Path,
+        default=None,
+        help="Optional LoRA checkpoint (.pt) to apply before prediction",
+    )
     return parser.parse_args()
 
 
@@ -93,6 +112,43 @@ def load_model(checkpoint_path: Path, backbone_name: str, device: torch.device) 
     return model
 
 
+def load_lora_weights(model: AutoPilotRegressor, lora_path: Path, device: torch.device) -> None:
+    checkpoint = torch.load(lora_path, map_location=device)
+    cfg = checkpoint.get("lora_config")
+    if cfg is None:
+        raise ValueError(f"LoRA checkpoint missing 'lora_config': {lora_path}")
+
+    config = LoRAConfig(
+        rank=int(cfg.get("rank", 8)),
+        alpha=float(cfg.get("alpha", 16.0)),
+        target_patterns=tuple(cfg.get("target_patterns", LoRAConfig().target_patterns)),
+    )
+
+    inject_lora(model.backbone, config)
+    model.to(device)
+
+    lora_state = checkpoint.get("lora_state")
+    if lora_state is None:
+        raise ValueError(f"LoRA checkpoint missing 'lora_state': {lora_path}")
+
+    modules = dict(model.named_modules())
+    for name, module in modules.items():
+        if not isinstance(module, LoRALinear):
+            continue
+        down_key = f"{name}.lora_down"
+        up_key = f"{name}.lora_up"
+        if down_key not in lora_state or up_key not in lora_state:
+            continue
+        module.lora_down.data.copy_(lora_state[down_key].to(module.lora_down.device))
+        module.lora_up.data.copy_(lora_state[up_key].to(module.lora_up.device))
+        alpha_key = f"{name}.alpha"
+        if alpha_key in lora_state:
+            alpha_val = lora_state[alpha_key]
+            module.alpha = float(alpha_val.item()) if torch.is_tensor(alpha_val) else float(alpha_val)
+            module.scaling = module.alpha / max(module.rank, 1)
+    print(f"[info] Loaded LoRA weights from {lora_path}")
+
+
 def build_transform(image_size: int, imagenet_norm: bool) -> T.Compose:
     """Build preprocessing transform."""
     ops = [
@@ -124,7 +180,7 @@ def read_raw_to_preview(raw_path: Path, long_side: int = 512) -> np.ndarray:
     return rgb
 
 
-def read_raw_linear_prophoto(raw_path: Path, max_resolution: int = 2048) -> torch.Tensor:
+def read_raw_linear_prophoto(raw_path: Path, max_resolution: int = None) -> torch.Tensor:
     """
     Read RAW in linear ProPhoto RGB for applying edits.
     Returns [1,3,H,W] float tensor.
@@ -139,7 +195,7 @@ def read_raw_linear_prophoto(raw_path: Path, max_resolution: int = 2048) -> torc
         )
 
     h, w = rgb16.shape[:2]
-    if max(h, w) > max_resolution:
+    if max_resolution is not None and max(h, w) > max_resolution:
         scale = max_resolution / max(h, w)
         new_w, new_h = int(round(w * scale)), int(round(h * scale))
         rgb16 = cv2.resize(rgb16, (new_w, new_h), interpolation=cv2.INTER_AREA)
@@ -170,17 +226,20 @@ def apply_edits_and_save_tiff(
     params_denorm: Dict[str, object],
     output_path: Path,
     bit_depth: int = 16,
-    max_resolution: int = 2048,
+    max_resolution: int = None,
+    icc_profile_path: Optional[Path] = None,
+    srgb_output: bool = False,
 ) -> None:
     """
-    Apply predicted edits to RAW and save as TIFF in ProPhoto RGB.
+    Apply predicted edits to RAW and save output either as ProPhoto TIFF or sRGB preview.
 
     Args:
         raw_path: Path to DNG file
         params_denorm: Denormalized ACR parameters
-        output_path: Output TIFF path
+        output_path: Output file path
         bit_depth: 8 or 16 bit output
-        max_resolution: Maximum resolution for rendering
+        max_resolution: Maximum resolution for rendering (None = original size)
+        srgb_output: When True, save sRGB preview data (PNG/TIFF) instead of ProPhoto TIFF
     """
     # Read RAW in linear ProPhoto RGB
     print(f"  Reading RAW: {raw_path.name}")
@@ -189,6 +248,21 @@ def apply_edits_and_save_tiff(
     # Apply edits using differentiable edit layer
     print(f"  Applying edits...")
     edited = edit_layer_realunits(raw_linear, params_denorm)
+
+    # sRGB export path (matches scripts/apply_lut behaviour)
+    if srgb_output:
+        preview01 = prophoto_to_srgb_preview(edited)
+        if bit_depth == 16:
+            data = (np.clip(preview01, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
+        else:
+            data = (np.clip(preview01, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        if bit_depth == 16:
+            tifffile.imwrite(output_path, data, photometric="rgb")
+        else:
+            iio.imwrite(output_path, data)
+        print(f"[saved] sRGB preview → {output_path}")
+        return
 
     # Convert to numpy and encode with ProPhoto gamma
     edited_np = edited.squeeze(0).permute(1, 2, 0).cpu().numpy()
@@ -205,7 +279,26 @@ def apply_edits_and_save_tiff(
 
     # Save TIFF
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    iio.imwrite(output_path, tiff_data)
+    icc_bytes = None
+    profile_path = icc_profile_path
+    if profile_path is None:
+        default_profile = Path(__file__).resolve().parent.parent / "ProPhoto.icm"
+        if default_profile.exists():
+            profile_path = default_profile
+    if profile_path is not None and profile_path.exists():
+        icc_bytes = profile_path.read_bytes()
+        print(f"  Embedding ICC profile from {profile_path}")
+    elif profile_path is not None:
+        print(f"  [warn] ICC profile not found at {profile_path}; writing TIFF without embedded profile")
+
+    with tifffile.TiffWriter(output_path) as tif:
+        tif.write(
+            tiff_data,
+            photometric="rgb",
+            contiguous=True,
+            metadata=None,
+            iccprofile=icc_bytes,
+        )
     print(f"[saved] TIFF → {output_path}")
 
 
@@ -237,6 +330,8 @@ def process_single_image(
     tiff_bit_depth: int,
     render_resolution: int,
     export_json: bool,
+    icc_profile_path: Optional[Path],
+    srgb_output: bool,
 ) -> None:
     """Process a single RAW image."""
     print(f"\n[processing] {raw_path.name}")
@@ -257,15 +352,21 @@ def process_single_image(
 
     # Generate output paths
     stem = raw_path.stem
-    tiff_path = output_dir / "tiff" / f"{stem}.tif"
+    if srgb_output:
+        ext = ".tif" if tiff_bit_depth == 16 else ".png"
+        output_path = output_dir / "srgb" / f"{stem}{ext}"
+    else:
+        output_path = output_dir / "tiff" / f"{stem}.tif"
 
     # Apply edits and save TIFF
     apply_edits_and_save_tiff(
         raw_path=raw_path,
         params_denorm=params_denorm,
-        output_path=tiff_path,
+        output_path=output_path,
         bit_depth=tiff_bit_depth,
         max_resolution=render_resolution,
+        icc_profile_path=icc_profile_path,
+        srgb_output=srgb_output,
     )
 
     # Optionally export JSON
@@ -280,6 +381,8 @@ def main():
 
     # Load model
     model = load_model(args.checkpoint, args.backbone, device)
+    if args.lora_checkpoint is not None:
+        load_lora_weights(model, args.lora_checkpoint, device)
     transform = build_transform(args.image_size, args.imagenet_norm)
 
     # Collect input files
@@ -309,6 +412,8 @@ def main():
                 tiff_bit_depth=args.tiff_bit_depth,
                 render_resolution=args.render_resolution,
                 export_json=args.export_json,
+                icc_profile_path=args.icc_profile,
+                srgb_output=args.srgb_output,
             )
         except Exception as e:
             import traceback
@@ -317,7 +422,10 @@ def main():
             continue
 
     print(f"\n[done] Processed {len(raw_files)} images")
-    print(f"[info] TIFFs saved to {(args.output / 'tiff').resolve()}")
+    if args.srgb_output:
+        print(f"[info] sRGB previews saved to {(args.output / 'srgb').resolve()}")
+    else:
+        print(f"[info] TIFFs saved to {(args.output / 'tiff').resolve()}")
 
 
 if __name__ == "__main__":

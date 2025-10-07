@@ -14,7 +14,16 @@ import torch.nn as nn
 class LoRAConfig:
     rank: int = 8
     alpha: float = 16.0
-    target_patterns: Sequence[str] = ("blocks.*.attn.qkv", "blocks.*.attn.proj", "blocks.*.mlp.fc1", "blocks.*.mlp.fc2")
+    target_patterns: Sequence[str] = (
+        "encoder.blocks.*.attn.qkv",
+        "encoder.blocks.*.attn.proj",
+        "encoder.blocks.*.mlp.fc1",
+        "encoder.blocks.*.mlp.fc2",
+        "blocks.*.attn.qkv",
+        "blocks.*.attn.proj",
+        "blocks.*.mlp.fc1",
+        "blocks.*.mlp.fc2",
+    )
 
 
 class LoRALinear(nn.Module):
