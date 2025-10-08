@@ -1,0 +1,11 @@
+numpy>=1.26
+torch
+torchvision
+torchaudio
+timm
+rawpy
+opencv-python
+tifffile
+imageio
+tqdm
+pillow

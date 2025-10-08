@@ -9,9 +9,10 @@ dependencies:
   - opencv
   - tqdm
   - pillow
+  - tifffile
   - pip:
       - torch
       - torchvision
       - torchaudio
       - rawpy
-
+      - timm
