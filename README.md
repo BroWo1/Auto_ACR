@@ -1,5 +1,7 @@
 # Auto ACR Autopilot
 
+![auto_acr](auto-acr.png)
+
 Auto ACR Autopilot is a production-ready helper for photographers and imaging pipelines that want Lightroom/Camera Raw quality edits without living inside Adobe tooling. It predicts Adobe Camera Raw (ACR) sliders and tone curves from RAW previews, applies them via a differentiable edit layer, and writes back TIFF or sRGB previews with full EXIF metadata preserved. The repo is organised around three practical workflows: use the published checkpoints, fine-tune the model with LoRA adapters, or rebuild everything from raw assets when you need a bespoke style.
 
 ## Project Overview
