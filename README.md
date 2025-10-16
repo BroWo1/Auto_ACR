@@ -12,7 +12,42 @@ Auto ACR pairs two subsystems:
 
 Auto ACR supports three stages: (1) parameter fitting on RAW/TIFF pairs, (2) model training or lightweight fine-tuning, and (3) inference/export where predictions are re-embedded with EXIF metadata for downstream tools.
 
-## Quick Start (Use the Pretrained Model)
+## WebUI Quick Start
+
+Run the helper script which will help you set up a conda or virtualenv environment (creating or updating it as needed) and then open the Gradio UI:
+
+```bash
+python launch_gradio.py
+```
+
+On macOS or Linux, you can use the shell wrapper (it provisions a virtualenv beside the repo):
+
+```bash
+./launch_gradio.sh
+```
+
+On Windows, the bundled batch file mirrors the same workflow with a virtualenv:
+
+```bat
+launch_gradio.bat
+```
+
+Or run the below python script after configurated the environment:
+
+```bash
+python run/gradio_app.py
+```
+
+Before launching the UI, pull down the base checkpoint and one of the published sample LoRA adapters from Hugging Face:
+
+```bash
+huggingface-cli download Willlllllllllll/Auto_ACR_base Auto_ACR_base_v0.2.pt --local-dir run
+huggingface-cli download Willlllllllllll/Auto_ACR_base lora/Lora_Sample_v0.3.pt --local-dir run/lora
+```
+
+Upload a `.dng` file, pick the base checkpoint (and optional LoRA adapter), and choose whether to export a ProPhoto TIFF or sRGB JPEG. You can either select bundled weights from the dropdowns or upload your own `.pt` checkpoints directly. The interface shows the predicted sliders, the input preview, and a rendered preview with a download link to the full-resolution output.
+
+## Project Setup
 
 1. **Install dependencies**
    ```bash
@@ -52,6 +87,7 @@ Auto ACR supports three stages: (1) parameter fitting on RAW/TIFF pairs, (2) mod
    ```
    The `--srgb-output` flag saves a JPEG preview in `outputs/rendered/srgb/` and preserves the source DNG EXIF/metadata in both JPEG and TIFF outputs. Add `--lora-checkpoint path/to/adapter.pt` to personalize the base model with one of the published LoRA weights.
 
+
 ## Working With LoRA Fine-Tunes
 
 LoRA adapters from [Willlllllllllll/Auto_ACR_base](https://huggingface.co/Willlllllllllll/Auto_ACR_base) drop in without retraining:
@@ -60,23 +96,43 @@ LoRA adapters from [Willlllllllllll/Auto_ACR_base](https://huggingface.co/Willll
   ```bash
   python run/predict_and_render.py \
     --checkpoint run/Auto_ACR_base_v0.2.pt \
-    --lora-checkpoint run/lora/portrait_soft.pt \
+    --lora-checkpoint run/lora/Lora_Sample_v0.3.pt \
     --input path/to/image.dng \
     --output outputs/rendered \
     --srgb-output
   ```
-- **Blend or create new adapters** with `run/lora_finetune.py`:
+
+**Preparing a fine-tune dataset**
+- Assemble 20–40 (more is better) closely matched edits from a single camera/look so the adapter learns a coherent style. Each sample must contain the untouched RAW `.dng` and a manually graded ProPhoto-linear, 16-bit `.tif` export with matching filenames.
+- Use `scripts/dng_tif_to_json.py` to fit ACR parameters and build a manifest in place:
   ```bash
-  python run/lora_finetune.py \
-    --manifest outputs/dataset_manifest.jsonl \
-    --checkpoint run/Auto_ACR_base_v0.2.pt \
-    --output outputs/lora \
-    --epochs 10 \
-    --batch-size 8 \
-    --lora-rank 12 \
-    --train-heads
+  python scripts/dng_tif_to_json.py \
+    --raw /path/to/raw_dngs \
+    --tif /path/to/prophoto_tiffs \
+    --out-json outputs/params \
+    --out-raw-preview outputs/previews/raw \
+    --out-edited-preview outputs/previews/edited \
+    --manifest outputs \
+    --split training \
+    --expert custom_style
   ```
-  The script saves `lora_epochXXX.pt` blobs containing only the adapter weights. Point `--lora-checkpoint` to the one you want when running inference or rendering.
+  This produces `outputs/style_manifest.jsonl` alongside per-image parameter JSON. Point `run/lora_finetune.py` at that manifest for training.
+
+**Reference hyperparameters**
+```bash
+python -m run.lora_finetune \
+  --manifest outputs/style_manifest.jsonl \
+  --checkpoint run/checkpoint_epoch019.pt \
+  --output outputs/lora_style \
+  --train-split training \
+  --epochs 20 \
+  --batch-size 8 \
+  --lora-rank 16 \
+  --lora-alpha 32 \
+  --lr 1e-3 \
+  --imagenet-norm \
+  --no-augment \
+```
 
 ## End-to-End Workflow (Optional)
 

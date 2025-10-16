@@ -17,11 +17,131 @@ conda env create -f environment.yml
 conda activate auto_acr
 ```
 
+Or use pip:
+```bash
+python -m venv .venv
+source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
 Key dependencies: PyTorch, rawpy, imageio, opencv, tqdm, timm (via pip)
+
+## Quick Reference
+
+**Most common commands:**
+
+1. **Use pretrained model** (recommended for most users):
+   ```bash
+   # Download checkpoint
+   pip install huggingface-hub
+   huggingface-cli download Willlllllllllll/Auto_ACR_base Auto_ACR_base_v0.2.pt --local-dir run
+
+   # Render edited TIFF + JPEG from RAW
+   python run/predict_and_render.py \
+     --checkpoint run/Auto_ACR_base_v0.2.pt \
+     --input photo.dng \
+     --output outputs/rendered \
+     --srgb-output
+   ```
+
+2. **Fine-tune with LoRA** (customize style):
+   ```bash
+   python run/lora_finetune.py \
+     --manifest outputs/dataset_manifest.jsonl \
+     --checkpoint run/Auto_ACR_base_v0.2.pt \
+     --output outputs/lora \
+     --epochs 10
+   ```
+
+3. **Train from scratch** (advanced):
+   ```bash
+   # Step 1: Fit parameters from RAW/TIFF pairs
+   python scripts/fivek_tif_to_xmp.py \
+     --root data/MITAboveFiveK \
+     --split training \
+     --expert c
+
+   # Step 2: Train model
+   python run/train_autopilot.py \
+     --manifest outputs/dataset_manifest.jsonl \
+     --use-edit-layer \
+     --epochs 20
+   ```
 
 ## Core Workflows
 
-### 1. Data Preparation (RAW → Parameters)
+### 1. Inference (Using Pretrained Models)
+
+**Download pretrained checkpoint:**
+```bash
+# Install huggingface-cli first: pip install huggingface-hub
+huggingface-cli download Willlllllllllll/Auto_ACR_base Auto_ACR_base_v0.2.pt --local-dir run
+```
+
+**Predict parameters only** (`run/inference.py`):
+```bash
+python run/inference.py \
+  --checkpoint run/Auto_ACR_base_v0.2.pt \
+  --input path/to/image.dng \
+  --output outputs/predictions \
+  --export-json \
+  --export-preview
+```
+
+**Predict and render edited TIFF** (`run/predict_and_render.py`):
+```bash
+python run/predict_and_render.py \
+  --checkpoint run/Auto_ACR_base_v0.2.pt \
+  --input path/to/image.dng \
+  --output outputs/rendered \
+  --srgb-output
+```
+
+**Key inference parameters**:
+- `--batch`: Process entire directory of RAW files
+- `--export-xmp`: Export XMP sidecar files (default: enabled)
+- `--export-json`: Export JSON parameter files
+- `--export-preview`: Export sRGB preview with predicted edits
+- `--srgb-output`: Save JPEG preview alongside TIFF
+- `--lora-checkpoint`: Apply LoRA adapter for style customization
+- `--icc-profile`: Path to linear ProPhoto ICC profile (default: `ProPhoto.icm`)
+
+**Outputs**:
+- XMP sidecars compatible with Adobe Camera Raw/Lightroom
+- TIFF files with full EXIF/metadata preservation
+- Optional JPEG previews in sRGB
+
+### 2. LoRA Fine-Tuning
+
+**Script**: `run/lora_finetune.py`
+
+Fine-tune the base model with low-rank adapters for style customization:
+
+```bash
+python run/lora_finetune.py \
+  --manifest outputs/dataset_manifest.jsonl \
+  --checkpoint run/Auto_ACR_base_v0.2.pt \
+  --output outputs/lora \
+  --epochs 10 \
+  --batch-size 8 \
+  --lora-rank 12 \
+  --train-heads
+```
+
+**Key LoRA parameters**:
+- `--lora-rank`: Adapter rank (default: 8, higher = more capacity)
+- `--lora-alpha`: Scaling factor (default: 16.0)
+- `--train-heads`: Also fine-tune slider/tone curve prediction heads
+- `--lora-target`: Module patterns to adapt (defaults to backbone attention/MLP layers)
+- `--save-frequency`: Save intermediate checkpoints every N epochs
+
+**Outputs**:
+- `lora_epochXXX.pt`: LoRA adapter checkpoints (only adapter weights, ~1-5MB)
+- Apply with `--lora-checkpoint` flag in inference/rendering scripts
+
+**Published LoRA adapters** available at `Willlllllllllll/Auto_ACR_base` (in `lora/` subfolder)
+
+### 3. Data Preparation (RAW → Parameters)
 
 **Script**: `scripts/fivek_tif_to_xmp.py`
 
@@ -60,7 +180,7 @@ The script uses a differentiable "mini-ACR" edit layer that models:
 
 All operations happen in **linear ProPhoto RGB** for color accuracy.
 
-### 2. Model Training
+### 4. Model Training (From Scratch)
 
 **Script**: `run/train_autopilot.py`
 
@@ -130,6 +250,48 @@ Image → ImageBackbone → [optional MetadataEncoder + Fusion] → { SlidersHea
 4. **Prediction Heads** (`model/heads.py`):
    - **SlidersHead**: Predicts 10 scalar parameters in [-1,1] via tanh
    - **ToneCurveHead**: Predicts monotone tone curve via softplus + cumsum normalization
+
+### LoRA Architecture (`model/lora.py`)
+
+**LoRALinear** wraps existing `nn.Linear` layers with low-rank residual updates:
+
+```python
+output = base_linear(x) + (alpha / rank) * (x @ lora_down @ lora_up)
+```
+
+- `lora_down`: [in_features, rank] initialized with Kaiming uniform
+- `lora_up`: [rank, out_features] initialized to zeros (identity at start)
+- Base weights are frozen during fine-tuning
+
+**inject_lora()** automatically replaces target layers:
+- Default targets: backbone attention (qkv, proj) and MLP (fc1, fc2) layers
+- Supports fnmatch patterns for flexible targeting
+- Returns list of replaced module names
+
+**LoRA checkpoint format**: Contains only adapter weights (~1-5MB vs ~80MB full model)
+
+### Differentiable Edit Layer (`model/edit_layer.py`)
+
+**DifferentiableEditLayer** applies ACR-style adjustments in a fully differentiable manner:
+
+**Edit pipeline** (applied sequentially in linear ProPhoto RGB):
+1. White balance: Channel gains derived from Temperature/Tint
+2. Exposure: Power-of-2 multiplication (EV stops)
+3. Contrast: Tanh S-curve around 0.5 midpoint
+4. Regional adjustments (Highlights, Shadows, Whites, Blacks):
+   - Luminance-based masks via sigmoid centered at pivot points
+   - Masks are mean-centered to preserve overall exposure
+5. Tone curve: Piecewise-linear interpolation with 1024-point LUT
+6. Vibrance: Adaptive saturation boost (stronger on desaturated pixels)
+7. Saturation: Uniform chroma scaling in YUV-like space
+
+**Key design choices**:
+- All operations preserve gradients for backpropagation
+- Clamping applied at each stage to prevent numerical instability
+- White balance normalized to maintain relative brightness
+- Tone curve uses gather-based interpolation for efficiency
+
+**Training usage**: Enable with `--use-edit-layer` flag to optimize predicted parameters for visual quality (image-space loss) instead of just parameter accuracy.
 
 ### Parameter Normalization (`params/ranges.py`)
 
@@ -238,7 +400,22 @@ data/MITAboveFiveK/
   testing.json
 ```
 
-Use `download_fivek_editor.py` to download the dataset (requires external `dataset/fivek.py` from yuukicammy/mit-adobe-fivek-dataset).
+**Download the dataset:**
+```bash
+python download_fivek_editor.py \
+  --root data/MITAboveFiveK \
+  --splits train val \
+  --experts c
+```
+
+Requires `dataset/fivek.py` from yuukicammy/mit-adobe-fivek-dataset. Use `--dataset-repo` to specify path if cloned elsewhere.
+
+## Utility Scripts
+
+- `scripts/dng_tif_to_json.py`: Fit parameters for any RAW/TIFF pair outside the FiveK dataset structure
+- `scripts/convert_tiff_to_prophoto.py`: Convert gamma-encoded TIFFs to linear ProPhoto TIFFs
+- `scripts/split_manifest.py`: Split manifest by expert or other criteria
+- `scripts/fix_manifest_paths.py`: Update manifest paths after moving files
 
 ## Important Notes
 
@@ -252,3 +429,5 @@ Use `download_fivek_editor.py` to download the dataset (requires external `datas
   - Auto-rebuilds from existing output files (scans preview/ and data/ directories)
   - Can safely resume after interruptions or deleted manifest
 - **Image-space training**: Use `--use-edit-layer` to optimize for visual quality instead of just parameter accuracy (requires more GPU memory).
+- **EXIF preservation**: All inference/rendering scripts preserve source EXIF metadata in outputs (TIFF and JPEG).
+- **LoRA adapters**: Lightweight (~1-5MB) style customization without retraining full model. Multiple adapters can be created and swapped at inference time.

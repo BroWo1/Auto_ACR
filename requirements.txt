@@ -9,3 +9,4 @@ tifffile
 imageio
 tqdm
 pillow
+gradio

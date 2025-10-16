@@ -19,6 +19,7 @@ Usage:
 import argparse
 import json
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -27,7 +28,6 @@ import torch
 import rawpy
 import cv2
 import tifffile
-import imageio.v3 as iio
 from PIL import Image
 from torchvision import transforms as T
 from torchvision.transforms import InterpolationMode
@@ -42,6 +42,87 @@ if str(scripts_path) not in sys.path:
     sys.path.insert(0, str(scripts_path))
 
 from fivek_tif_to_xmp import edit_layer_realunits, prophoto_to_srgb_preview
+
+
+@dataclass
+class SourceMetadata:
+    """Subset of EXIF/TIFF metadata we propagate to outputs."""
+
+    exif_bytes: Optional[bytes] = None
+    make: Optional[str] = None
+    model: Optional[str] = None
+    datetime: Optional[str] = None
+    orientation: Optional[int] = None
+
+
+def _normalize_ascii(value: object) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return value.decode("utf-8", "ignore").rstrip("\x00") or None
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            normalized = _normalize_ascii(item)
+            if normalized:
+                return normalized
+        return None
+    text = str(value)
+    return text.rstrip("\x00") or None
+
+
+def _normalize_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)) and value:
+        value = value[0]
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _ascii_tag(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return value.encode("ascii", "ignore").decode("ascii").strip() or None
+
+
+def extract_source_metadata(raw_path: Path) -> SourceMetadata:
+    """Read EXIF/TIFF tags from the source DNG for downstream export."""
+
+    metadata = SourceMetadata()
+
+    try:
+        with Image.open(raw_path) as raw_image:
+            raw_exif = raw_image.info.get("exif")
+            if raw_exif:
+                metadata.exif_bytes = raw_exif
+            tags = getattr(raw_image, "tag_v2", {})
+            if tags:
+                metadata.make = metadata.make or _normalize_ascii(tags.get(271))
+                metadata.model = metadata.model or _normalize_ascii(tags.get(272))
+                metadata.datetime = metadata.datetime or _normalize_ascii(tags.get(306))
+                metadata.orientation = metadata.orientation or _normalize_int(tags.get(274))
+    except Exception as exc:  # pragma: no cover - extraction best effort
+        print(f"[warn] Unable to read EXIF via Pillow for {raw_path.name}: {exc}")
+
+    # Fallback to tifffile for any missing fields.
+    try:
+        with tifffile.TiffFile(raw_path) as tif:
+            page = tif.pages[0]
+            tags = page.tags
+            if metadata.make is None and "Make" in tags:
+                metadata.make = _normalize_ascii(tags["Make"].value)
+            if metadata.model is None and "Model" in tags:
+                metadata.model = _normalize_ascii(tags["Model"].value)
+            if metadata.datetime is None and "DateTime" in tags:
+                metadata.datetime = _normalize_ascii(tags["DateTime"].value)
+            if metadata.orientation is None and "Orientation" in tags:
+                metadata.orientation = _normalize_int(tags["Orientation"].value)
+    except Exception as exc:  # pragma: no cover - extraction best effort
+        print(f"[warn] Unable to read EXIF via tifffile for {raw_path.name}: {exc}")
+
+    return metadata
 
 # ImageNet normalization
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -70,7 +151,7 @@ def parse_args():
     parser.add_argument(
         "--srgb-output",
         action="store_true",
-        help="Render edits as sRGB preview using the same pipeline as scripts/apply_lut",
+        help="Render edits as sRGB JPEG preview using the same pipeline as scripts/apply_lut",
     )
     parser.add_argument(
         "--lora-checkpoint",
@@ -229,6 +310,7 @@ def apply_edits_and_save_tiff(
     max_resolution: int = None,
     icc_profile_path: Optional[Path] = None,
     srgb_output: bool = False,
+    metadata: Optional[SourceMetadata] = None,
 ) -> None:
     """
     Apply predicted edits to RAW and save output either as ProPhoto TIFF or sRGB preview.
@@ -239,7 +321,8 @@ def apply_edits_and_save_tiff(
         output_path: Output file path
         bit_depth: 8 or 16 bit output
         max_resolution: Maximum resolution for rendering (None = original size)
-        srgb_output: When True, save sRGB preview data (PNG/TIFF) instead of ProPhoto TIFF
+        srgb_output: When True, save an sRGB JPEG preview instead of a ProPhoto TIFF
+        metadata: Source EXIF/TIFF metadata to embed in outputs when available
     """
     # Read RAW in linear ProPhoto RGB
     print(f"  Reading RAW: {raw_path.name}")
@@ -251,16 +334,18 @@ def apply_edits_and_save_tiff(
 
     # sRGB export path (matches scripts/apply_lut behaviour)
     if srgb_output:
-        preview01 = prophoto_to_srgb_preview(edited)
-        if bit_depth == 16:
-            data = (np.clip(preview01, 0.0, 1.0) * 65535.0 + 0.5).astype(np.uint16)
-        else:
-            data = (np.clip(preview01, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+        preview01 = np.clip(prophoto_to_srgb_preview(edited), 0.0, 1.0)
+        if bit_depth != 8:
+            print("  [warn] --tiff-bit-depth is ignored for JPEG previews (forcing 8-bit)")
+        data = (preview01 * 255.0 + 0.5).astype(np.uint8)
+        if output_path.suffix.lower() != ".jpg":
+            output_path = output_path.with_suffix(".jpg")
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        if bit_depth == 16:
-            tifffile.imwrite(output_path, data, photometric="rgb")
-        else:
-            iio.imwrite(output_path, data)
+        pil_image = Image.fromarray(data, mode="RGB")
+        save_kwargs: Dict[str, object] = {"quality": 95}
+        if metadata and metadata.exif_bytes:
+            save_kwargs["exif"] = metadata.exif_bytes
+        pil_image.save(output_path, format="JPEG", **save_kwargs)
         print(f"[saved] sRGB preview → {output_path}")
         return
 
@@ -291,14 +376,43 @@ def apply_edits_and_save_tiff(
     elif profile_path is not None:
         print(f"  [warn] ICC profile not found at {profile_path}; writing TIFF without embedded profile")
 
-    with tifffile.TiffWriter(output_path) as tif:
-        tif.write(
-            tiff_data,
-            photometric="rgb",
-            contiguous=True,
-            metadata=None,
-            iccprofile=icc_bytes,
-        )
+    extratags = []
+    software_tag = _ascii_tag("Auto_ACR Autopilot")
+    if software_tag:
+        extratags.append((305, "s", len(software_tag) + 1, software_tag + "\x00", False))
+    if metadata:
+        make_tag = _ascii_tag(metadata.make)
+        model_tag = _ascii_tag(metadata.model)
+        datetime_tag = _ascii_tag(metadata.datetime)
+        if make_tag:
+            extratags.append((271, "s", len(make_tag) + 1, make_tag + "\x00", False))
+        if model_tag:
+            extratags.append((272, "s", len(model_tag) + 1, model_tag + "\x00", False))
+        if datetime_tag:
+            extratags.append((306, "s", len(datetime_tag) + 1, datetime_tag + "\x00", False))
+        if metadata.orientation is not None:
+            extratags.append((274, "H", 1, int(metadata.orientation), False))
+
+    try:
+        with tifffile.TiffWriter(output_path) as tif:
+            tif.write(
+                tiff_data,
+                photometric="rgb",
+                contiguous=True,
+                metadata=None,
+                iccprofile=icc_bytes,
+                extratags=extratags,
+            )
+    except Exception as exc:
+        print(f"  [warn] Failed to embed TIFF metadata ({exc}); writing without extras")
+        with tifffile.TiffWriter(output_path) as tif:
+            tif.write(
+                tiff_data,
+                photometric="rgb",
+                contiguous=True,
+                metadata=None,
+                iccprofile=icc_bytes,
+            )
     print(f"[saved] TIFF → {output_path}")
 
 
@@ -353,10 +467,11 @@ def process_single_image(
     # Generate output paths
     stem = raw_path.stem
     if srgb_output:
-        ext = ".tif" if tiff_bit_depth == 16 else ".png"
-        output_path = output_dir / "srgb" / f"{stem}{ext}"
+        output_path = output_dir / "srgb" / f"{stem}.jpg"
     else:
         output_path = output_dir / "tiff" / f"{stem}.tif"
+
+    source_metadata = extract_source_metadata(raw_path)
 
     # Apply edits and save TIFF
     apply_edits_and_save_tiff(
@@ -367,6 +482,7 @@ def process_single_image(
         max_resolution=render_resolution,
         icc_profile_path=icc_profile_path,
         srgb_output=srgb_output,
+        metadata=source_metadata,
     )
 
     # Optionally export JSON

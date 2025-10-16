@@ -16,3 +16,4 @@ dependencies:
       - torchaudio
       - rawpy
       - timm
+      - gradio
